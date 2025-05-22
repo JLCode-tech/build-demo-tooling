@@ -5,8 +5,7 @@
 ## Overview
 
 This repository contains an automated GitOps-driven local Kubernetes demo environment.  
-It enables team members to easily deploy repeatable Kubernetes clusters and workloads  
-on Apple Silicon MacBook Pro (M1/M2) devices using:  
+It enables team members to easily deploy repeatable Kubernetes clusters and workloads:  
   
 - K3s for Lightweight Kubernetes clusters  
 - Podman as container runtime  
