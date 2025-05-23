@@ -1,239 +1,186 @@
-# README.md
+# Multi-Tenant Kubernetes Demo Platform
 
-## Concept Outline
+This project provides a lightweight, automated platform for managing multiple Kubernetes tenant clusters using a single management cluster. It enables rapid, repeatable deployments of F5 BIG-IP Next Kubernetes (BNK) and Service Proxy Kubernetes (SPK) for business development (BD) and sales demos.
 
-- Single Management Cluster: You want to use a single lightweight Kubernetes (k3s) management cluster to bootstrap/manage multiple tenant clusters for easy BD/Sales demos.
-- Tenant Clusters Management: Automate lifecycle (creation, update, delete) and management of multiple tenant clusters.
-- Reusable cluster Templates & Deployments: Easily reproduce clusters with consistent base builds and configuration.
-- Deploy F5 Products: Automate deployment of F5 BIG-IP Next Kubernetes (BNK) or Service Proxy Kubernetes (SPK) onto any tenant cluster.
+## Overview
 
-## Tools Selected and their Roles:
+- **Goal**: Use a single lightweight Kubernetes (k3s) management cluster to bootstrap and manage multiple tenant clusters for easy, repeatable demos.
+- **Key Features**:
+  - Automated lifecycle management (create, update, delete) of tenant clusters.
+  - Reusable cluster templates for consistent deployments.
+  - GitOps-driven configuration with ArgoCD for declarative, version-controlled setups.
+  - Automated deployment of F5 BNK or SPK on tenant clusters.
+  - Support for laptop, on-premises, and public cloud environments.
 
-Kamaji
-Enables multi-tenant Kubernetes providing tenant clusters control plane management without spinning up separate virtual machines for control plane nodes. Efficient multi-tenancy.
+## Architecture
 
-ArgoCD
-GitOps tool to automatically deploy/update configuration of your clusters and applications from version-control repository (Git).
+The platform uses a single **k3s management cluster** to orchestrate tenant clusters, leveraging the following tools:
 
-Crossplane
-Declarative orchestration of cloud infrastructure or on-prem infrastructure resources via k8s YAML manifests; ideal for creating repeatable, consistent infrastructure provisioning and integrations.
+### Tools and Roles
 
-metal3.io
-Kubernetes-native bare-metal provisioning (important if clusters need bare-metal nodes or dedicated hardware provisioning).
+- **Kamaji**: Manages tenant cluster control planes for efficient multi-tenancy without dedicated VMs.
+- **ArgoCD**: GitOps tool for continuous deployment and configuration management from Git repositories.
+- **Crossplane**: Declarative infrastructure provisioning (cloud or on-premises) using Kubernetes YAML manifests.
+- **Metal3.io**: Provisions bare-metal nodes (optional, for dedicated hardware scenarios).
+- **Sveltos**: Simplifies declarative management of addons (e.g., logging, monitoring, ingress) across multiple clusters.
 
-Sveltos
-Provides declarative management of cluster addons across multiple Kubernetes clusters, simplifies multi-cluster management strategies.
+### Architecture Diagram
 
-## Proposed Implementation Architecture:
 ```
-+------------------------------------------------------------------------------+
-| Management (k3s) Cluster Infrastructure                                      |
-|------------------------------------------------------------------------------|
-| +----------+   +-------+    +--------------+   +----------+  +------------+  |
-| | Kamaji   |---|sveltos|----| ArgoCD       |---|Crossplane|--| metal3.io  |  |
-| +----------+   +-------+    +--------------+   +----------+  +------------+  |
-|   |              |               |                  |              |         |
-|   |              |               |                  |              |         |
-| Tenant Control Plane   Multi-Cluster     GitOps            Infra automation  |
-| Provisioning & Multi     Addon           continuous        with Crossplane   |
-| tenancy via Kamaji      Deployments     delivery & state   (+ metal3 for HW) |
-|                          via Sveltos    from Git repos                       |
-+------------------------------------------------------------------------------+
-
-                            ↓ Tenant Clusters ↓
-            (clusters provisioned from above tooling, auto-configured)
-            _______________________________________
-            | Clusters       | Base Infra Configs |
-            |----------------+------------------- |
-            | Tenant-a       | F5 BNK             |
-            | Tenant-b       | F5 SPK             |
-            | Tenant-c       | Base Kubernetes    |
-            | ...            |                    |
-            ---------------------------------------
++---------------------------------------------------------------+
+| Management Cluster (k3s)                                      |
+|---------------------------------------------------------------|
+| Kamaji   | Sveltos | ArgoCD   | Crossplane | Metal3.io (opt.) |
+| Tenant   | Addon   | GitOps   | Infra      | Bare-metal       |
+| Control  | Mgmt    | Delivery | Provision  | Provisioning     |
++---------------------------------------------------------------+
+          ↓ Tenant Clusters (auto-provisioned) ↓
++---------------------------------------------+
+| Tenant-a | F5 BNK                           |
+| Tenant-b | F5 SPK                           |
+| Tenant-c | Base Kubernetes                 |
+| ...      |                                 |
++---------------------------------------------+
 ```
 
-## High-Level Workflow:
-1. Configured Management Cluster (k3s + Tooling Setup):
-Deploy K3s (quick, lightweight, easy).
-Install Kamaji for isolated tenant control plane deployments.
-Deploy Crossplane onto the management cluster for infrastructure provisioning automation.
-Deploy metal3.io if bare metal management or dedicated hardware environments are required.
-Deploy ArgoCD for continuous GitOps deployment to keep configurations consistent.
-Deploy Sveltos for managing standardized addon deployments and uniform deployments across multiple clusters (logging, monitoring, ingress).
-2. Tenant Cluster Lifecycle Management:
-Tenant cluster control plane managed by Kamaji (fast to deploy multi-tenant clusters with reduced overhead).
-Infrastructure nodes (worker nodes, hardware provisioned nodes) can be provisioned through Crossplane (and potentially Metal3.io when bare-metal or dedicated nodes are needed). Crossplane coordinates replacement of existing IaaS (cloud infrastructure requests, bare-metal nodes provisioning).
-3. GitOps with ArgoCD for Declarative, Repeatable Configuration:
-ArgoCD watches Git repo for any Kubernetes manifests:
-Setup for consistent tenant cluster base build (RBAC, Policies, Monitoring, Networking, CNI plugins).
-Automated F5 SPK/BNK Product Deployments and their complete repeatable setup.
-Changes in Git trigger automatic reconciliation & updates through ArgoCD, simplifying demos, and deployment management.
-Role of Sveltos to streamline multi-cluster addon deployments declaratively.
-4. Deploying F5 BNK/SPK:
-Create reusable ArgoCD GitOps repositories for F5 BNK and SPK installation.
-Optionally abstract these deployments via Sveltos templates for easy multi-cluster addon rollout.
-Quickly provisioning and demoing F5’s Kubernetes-based software becomes straightforward to spin up for BD/Sales demos.
+## Workflow
 
-### Example Demo/Dev Scenario:
-Flow:
-```
-Team member needs a demo of F5 SPK →
-- Kamaji provisions new tenant cluster control plane (minutes or less).
-- Crossplane/Metal3 provisions or maps worker nodes (separate or bare-metal hosts).
-- ArgoCD automatically syncs base build (Prometheus, Grafana, networking configs, Ingress).
-- Sveltos manages consistent multi-cluster addon setups across clusters.
-- Specific demo manifests (f5 spk manifests) synced and deployed automatically via ArgoCD.
-The cluster is spun up automatically and is instantly demo-ready.
-```
+1. **Setup Management Cluster**:
+   - Deploy k3s (lightweight Kubernetes).
+   - Install Kamaji, ArgoCD, Crossplane, Sveltos, and (optionally) Metal3.io.
+2. **Provision Tenant Clusters**:
+   - Kamaji creates tenant control planes.
+   - Crossplane (and Metal3.io, if needed) provisions worker nodes.
+3. **Configure with GitOps**:
+   - ArgoCD syncs cluster configurations (RBAC, networking, monitoring) from Git.
+   - Sveltos deploys consistent addons across clusters.
+4. **Deploy F5 Products**:
+   - ArgoCD applies F5 BNK or SPK manifests from Git.
+   - Sveltos ensures consistent addon deployments for demos.
 
+### Example Demo Scenario
 
-## Practical Steps (Implementation High-Level Walkthrough):
-### Step 1: Setup Bootstrap/Management K3s Cluster
-```
+1. A team member requests an F5 SPK demo.
+2. Kamaji provisions a tenant cluster control plane (~minutes).
+3. Crossplane/Metal3 provisions worker nodes.
+4. ArgoCD syncs base configurations (e.g., Prometheus, Grafana, ingress).
+5. Sveltos applies multi-cluster addons.
+6. ArgoCD deploys F5 SPK manifests, making the cluster demo-ready.
+
+## Implementation Steps
+
+### 1. Bootstrap Management Cluster
+Install k3s on your chosen environment (laptop, on-premises, or cloud):
+
+```bash
 curl -sfL https://get.k3s.io | sh -
-# Check if running
 kubectl get nodes
 ```
 
-### Step 2: Install Kamaji, ArgoCD, Crossplane, and Metal3 (optional)
-Installation via helm or kubectl manifests from each product docs or public repos:
-Kamaji: https://github.com/clastix/kamaji
-ArgoCD: https://argo-cd.readthedocs.io/
-Crossplane: https://crossplane.io/docs
-Metal3 (for metal node provisioning): https://metal3.io
-Sveltos: https://github.com/projectsveltos/sveltos
+### 2. Install Core Tools
+Deploy Kamaji, ArgoCD, Crossplane, Sveltos, and (optionally) Metal3.io using Helm or manifests:
+- **Kamaji**: [clastix/kamaji](https://github.com/clastix/kamaji)
+- **ArgoCD**: [argo-cd.readthedocs.io](https://argo-cd.readthedocs.io/)
+- **Crossplane**: [crossplane.io/docs](https://crossplane.io/docs)
+- **Metal3.io**: [metal3.io](https://metal3.io)
+- **Sveltos**: [projectsveltos/sveltos](https://github.com/projectsveltos/sveltos)
 
-### Example installing ArgoCD with Helm:
-```
+Example: Install ArgoCD with Helm:
+
+```bash
 helm repo add argo https://argoproj.github.io/argo-helm
 helm install argocd argo/argo-cd --version=x.y.z -n argocd --create-namespace
 ```
 
-### Step 3: GitOps Repository Structure (example)
-your-gitops-repo/
-  ├── clusters/
-  │    ├── tenant-a.yaml     (Kamaji tenant control plane definitions)
-  │    ├── tenant-b.yaml
-  │    └── tenant-c.yaml
-  ├── addons/
-  │    ├── base/
-  │    ├── monitoring/
-  │    └── ingress/
-  └── demos/
-       ├── f5-bnk/
-       └── f5-spk/
-
-
-### Step 4: Integrate F5 BNK/SPK installation Manifest standards provided by F5
-Add manifests and F5 installation scripts or YAML into "demos/f5-bnk" or "demos/f5-spk".
-ArgoCD automatically applies to tenant clusters based on demo needs and customer scenario.
-Key Benefits (Outcome)
-Rapidly build repeatable demos for Sales Teams
-Clear separation of infrastructure & application layer
-GitOps for consistent state, version history, traceability
-Efficient multi-tenant Kubernetes management with minimal overhead (via Kamaji)
-Seamless infrastructure automation (Crossplane, Metal3)
-Faster time from request to demo especially for repeated, common use-cases (F5 BNK, SPK).
-
-## Next Steps / Recommendation:
-Start with a small PoC (Proof-of-Concept) → incrementally add components.
-Validate each component independently before integrating all tooling together:
-Get Kamaji clusters running first, then layer Argo, Crossplane, etc.
-Create documentation/playbooks to allow easy repeatability and onboarding sales/BD teams.
-
-
-
-## Recommended Tooling Setup Overview
+### 3. Configure GitOps Repository
+Structure your Git repository for portability and automation:
 
 ```
-[ Setup / Infrastructure toolset ]
-- Hosting Provider (AWS/Azure/GCP/On-prem)
-- Kubernetes Infra (k3s on VMs or physical machines)
-- Infrastructure-as-Code (IaC): Crossplane
-- Bare-metal/physical node provisioner: Metal3 (if applicable)
-
-[ Platform Management Core Components ]
-- Multi-tenancy control planes: Kamaji
-- GitOps deployment & upgrades: ArgoCD
-- Multi-cluster addon management: Project Sveltos
-- Git infrastructure: (GitHub / GitLab Public + Private Repos)
-- Container Registry (Docker Hub / Harbor / ECR/ACR/GCR)
-
-[ Supporting Infra, Security & Observability components ]
-- Secrets Management: Vault or Sealed Secrets / External Secrets
-- Observability stack: Prometheus, Grafana, Loki, OpenTelemetry
-- ingress Controller: Nginx ingress controller / Traefik / F5 CIS
-- Storage Provider: Longhorn, Rook/Ceph or OpenEBS
-- DNS & Cert management: External DNS + cert-manager
-- RBAC/User Identity: (optional: Keycloak or AD/OAuth integration)
-- Backup Tooling (Velero/Kasten)
-- MetalLB (LB internal to demo)
-
-[ Optional Advanced Special-Purpose tools ] 
-- CI/CD Pipeline (if heavy build cycles/demo automation): GitHub runner/Tekton/GitLab runner
-- Service Mesh (if demos show this): Istio/Linkerd/Kuma
-- Log aggregation: Elastic Stack or Grafana Loki
-```
-
-## 📌 Flexible Infrastructure Scenarios clearly defined:
-
-Laptop
-k3s (Lightweight K8s) + Kamaji + ArgoCD + Crossplane + MetalLB + Sveltos
-Portable, lightweight, easy local-demo setup
-
-On-prem (e.g., UDF lab or internal datacenter)
-k3s/Kamaji/ArgoCD + Crossplane + Metal3.io + MetalLB + Sveltos
-Suitable for bare-metal or on-prem VMs, Metal3 for node provisioning
-
-Public Cloud (AWS/Azure/GCP)
-K3s (or cloud-managed Kubernetes) + Kamaji + ArgoCD + Crossplane + cloud-provider LB(Crossplane-cloud-provider) + Sveltos
-
-
-## 📌 GitOps (ArgoCD) recommended Git repos structure (Portability driven):
-It's strongly recommended you leverage this base setup:
-
-```
-demo-environment-gitops (Root Git Repo)
+demo-environment-gitops/
 ├── README.md
 ├── documentation/
-│     ├── quickstart-laptop.md
-│     ├── quickstart-onprem.md
-│     └── quickstart-cloud.md
-├── infra-setup/             
-│     ├── metal3/                   # for bare-metal node provisioning
-│     ├── metallb/                  # MetalLB Load balancer manifests
-│     └── crossplane-provider/      # cloud-provider infrastructure declarations
-│
-├── kamaji-clusters/                # multi-tenant tenant clusters (Kamaji tenant setups)
-│     ├── tenant-laptop-demo.yaml
-│     ├── tenant-onprem-demo.yaml
-│     └── tenant-cloud-demo.yaml
-│
-├── base-addons/                    # Base addons deployed by Sveltos / ArgoCD (ingress, storage, cert-manager)
-│
-├── demos/                          
-│     ├── f5-bnk/                   # sample/demo manifests for F5 BNK
-│     ├── f5-spk/                   # sample/demo manifests for F5 SPK
-│     └── other-products/
-│
-├── clusters-apps/                  # tenant clusters advanced demos/apps (optional)
-│     └── example-app1/
-│     └── example-app2/
-│
-└── scripts/
-      ├── bootstrap-laptop.sh
-      ├── bootstrap-onprem.sh
-      └── bootstrap-cloud.sh
+│   ├── quickstart-laptop.md
+│   ├── quickstart-onprem.md
+│   └── quickstart-cloud.md
+├── infra-setup/
+│   ├── crossplane-provider/  # Cloud/on-prem infrastructure
+│   ├── metallb/             # Load balancer manifests
+│   └── metal3/              # Bare-metal provisioning
+├── kamaji-clusters/         # Tenant cluster definitions
+│   ├── tenant-laptop.yaml
+│   ├── tenant-onprem.yaml
+│   └── tenant-cloud.yaml
+├── base-addons/             # Monitoring, ingress, storage
+├── demos/                   # F5 product manifests
+│   ├── f5-bnk/
+│   └── f5-spk/
+├── clusters-apps/           # Optional advanced demo apps
+└── scripts/                 # Bootstrap scripts
+    ├── bootstrap-laptop.sh
+    ├── bootstrap-onprem.sh
+    └── bootstrap-cloud.sh
 ```
 
-## 🛠 Practical Implementation "Roadmap" (Step-by-Step recommendation):
-- Phase 1 (now):
-Local laptop PoC (k3s + Kamaji + ArgoCD + MetalLB + Crossplane minimal)
-Test multi-tenant cluster deployments locally
+### 4. Deploy F5 Products
+- Add F5 BNK/SPK manifests to `demos/f5-bnk/` or `demos/f5-spk/`.
+- ArgoCD applies these manifests to tenant clusters.
+- Use Sveltos for consistent multi-cluster addon deployments.
 
-- Phase 2 (next):
-Port this locally working demo to a small UDF environment or internal datacenter
-Add Metal3.io if physical hardware provided in UDF environment
+## Benefits
 
-- Phase 3 (later):
-Setup Public cloud demo with Crossplane cloud providers integration (AWS, Azure, GCP provider modules via Crossplane)
+- **Rapid Demos**: Spin up tenant clusters in minutes for sales/BD teams.
+- **Consistency**: GitOps ensures repeatable, version-controlled configurations.
+- **Multi-Tenancy**: Kamaji enables efficient tenant cluster management.
+- **Flexibility**: Supports laptop, on-premises, and cloud environments.
+- **Automation**: Crossplane and Metal3 streamline infrastructure provisioning.
+
+## Recommended Tooling
+
+### Core Infrastructure
+- **Kubernetes**: k3s (lightweight, portable).
+- **IaC**: Crossplane (cloud/on-prem provisioning).
+- **Bare-Metal**: Metal3.io (optional).
+- **GitOps**: ArgoCD.
+- **Multi-Cluster Addons**: Sveltos.
+- **Container Registry**: Docker Hub, Harbor, or cloud-native registries (ECR/ACR/GCR).
+
+### Observability & Security
+- **Monitoring**: Prometheus, Grafana, Loki, OpenTelemetry.
+- **Ingress**: Nginx, Traefik, or F5 CIS.
+- **Storage**: Longhorn, Rook/Ceph, or OpenEBS.
+- **Secrets**: Vault, Sealed Secrets, or External Secrets.
+- **DNS/Certs**: External DNS, cert-manager.
+- **Backup**: Velero or Kasten.
+- **Load Balancer**: MetalLB.
+
+### Optional Tools
+- **CI/CD**: GitHub Actions, Tekton, or GitLab Runner.
+- **Service Mesh**: Istio, Linkerd, or Kuma.
+- **Log Aggregation**: Grafana Loki or Elastic Stack.
+
+## Supported Environments
+
+| Environment | Tools | Notes |
+|-------------|-------|-------|
+| **Laptop** | k3s, Kamaji, ArgoCD, Crossplane, MetalLB, Sveltos | Lightweight, portable demos. |
+| **On-Premises** | k3s, Kamaji, ArgoCD, Crossplane, Metal3.io, MetalLB, Sveltos | Bare-metal or VM-based, uses Metal3 for hardware. |
+| **Cloud (AWS/Azure/GCP)** | k3s or cloud-managed Kubernetes, Kamaji, ArgoCD, Crossplane, cloud LB, Sveltos | Cloud-native integrations via Crossplane. |
+
+## Roadmap
+
+1. **Phase 1 (PoC)**:
+   - Test k3s + Kamaji + ArgoCD + MetalLB + Crossplane on a laptop.
+   - Validate multi-tenant cluster provisioning.
+2. **Phase 2 (On-Premises)**:
+   - Deploy to a UDF lab or datacenter.
+   - Add Metal3.io for bare-metal provisioning.
+3. **Phase 3 (Cloud)**:
+   - Extend to AWS, Azure, or GCP with Crossplane cloud providers.
+   - Document playbooks for sales/BD teams.
+
+## Next Steps
+
+- Start with a laptop-based PoC to validate core components.
+- Test each tool (Kamaji, ArgoCD, Crossplane, Sveltos) independently.
+- Build documentation and scripts for repeatability.
+- Expand to on-premises or cloud environments as needed.
