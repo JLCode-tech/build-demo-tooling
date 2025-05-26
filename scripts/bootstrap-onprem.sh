@@ -24,7 +24,7 @@ SVELTOS_VERSION="0.54.0"
 GITOPS_REPO_URL="https://github.com/JLCode-tech/build-demo-tooling.git"
 GITOPS_REPO_DIR="${INSTALL_DIR}/build-demo-tooling"
 LOG_FILE="/tmp/bootstrap-onprem-$(date +%Y%m%d_%H%M%S).log"
-INSTALL_METALLB="true"  # Set to "false" if you want to skip installing MetalLB
+INSTALL_METALLB="false"  # Set to "false" if you want to skip installing MetalLB
 METALLB_IP_POOL="10.10.20.240/28"  # Update per your networking requirements
 
 ## Logging Functions ##
