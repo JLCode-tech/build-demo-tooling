@@ -4,22 +4,27 @@
 # Sets up a K3s management cluster on a MacBook Pro M1 using Podman for a multi-tenant demo environment.
 # Compatible with arm64 architecture, runs without sudo, includes optional MetalLB support, and configures ArgoCD to watch a remote GitOps repo.
 # Idempotent: Can be run multiple times to ensure consistent state or apply updates.
+# Uses GitHub fine-grained personal access token (PAT) for HTTPS access to https://github.com/JLCode-tech/build-demo-tooling.git.
+# Avoids creating files in the build-demo-tooling repository and adds .gitignore entries for setup artifacts.
+# Relaxes kubectl version requirement to v1.28.x-v1.33.x for flexibility.
+# Runs K3s as a Podman container on macOS to avoid systemd/openrc dependency.
+# Ensures Podman machine is initialized and running, with dynamic socket detection.
 
 set -euo pipefail
 
 # --- Configuration Variables ---
 # Installation paths and versions
 INSTALL_DIR="${HOME}/.k3s-demo"
-K3S_VERSION="${K3S_VERSION:-v1.29.4+k3s1}" # Stable version as of May 2025
+K3S_VERSION="${K3S_VERSION:-v1.29.4-k3s1}" # Stable version as of May 2025
 HELM_VERSION="v3.15.4" # Stable Helm version
-KUBECTL_VERSION="v1.29.4" # Match K3s version
+KUBECTL_VERSION="v1.29.4" # Preferred kubectl version
 ARGOCD_VERSION="2.12.5" # ArgoCD Helm chart version
 KAMAJI_VERSION="0.5.0" # Kamaji Helm chart version
 CROSSPLANE_VERSION="1.16.0" # Crossplane Helm chart version
 METALLB_VERSION="0.14.5" # MetalLB Helm chart version
 SVELTOS_VERSION="0.24.0" # Sveltos Helm chart version
 GITOPS_REPO_DIR="${INSTALL_DIR}/demo-environment-gitops"
-LOG_FILE="${INSTALL_DIR}/bootstrap.log"
+LOG_FILE="/tmp/bootstrap-k3s-$(date +%s).log" # Temporary log file
 
 # MetalLB configuration
 INSTALL_METALLB="${INSTALL_METALLB:-false}" # Set to true to enable MetalLB, false for NodePort
@@ -29,7 +34,8 @@ METALLB_IP_POOL="${METALLB_IP_POOL:-192.168.1.240/28}" # IP range for MetalLB Lo
 K3S_BIN_DIR="${INSTALL_DIR}/bin"
 K3S_CONFIG_DIR="${INSTALL_DIR}/config"
 K3S_DATA_DIR="${HOME}/.rancher/k3s"
-K3S_EXEC="server --disable=traefik --data-dir=${K3S_DATA_DIR} --kubelet-arg=provider-id=host://localhost"
+K3S_EXEC="server --disable=traefik --disable-network-policy --flannel-backend=vxlan --data-dir=${K3S_DATA_DIR}"
+#K3S_EXEC="server --disable=traefik --data-dir=${K3S_DATA_DIR} --kubelet-arg=provider-id=host://localhost"
 
 # ArgoCD GitOps configuration
 ARGOCD_APP_NAME="gitops-demo"
@@ -64,36 +70,101 @@ check_command() {
 
 check_podman() {
     podman --version >/dev/null 2>&1 || log_error "Podman is required but not installed. Install via 'brew install podman'."
-    podman system service --time=0 >/dev/null 2>&1 || {
-        log_info "Starting Podman system service..."
-        podman system service --time=0 &
-        sleep 2
-    }
+    local podman_version
+    podman_version=$(podman --version | awk '{print $3}')
+    log_info "Podman version: ${podman_version}"
+    if [[ "${podman_version}" < "4.0.0" ]]; then
+        log_error "Podman version ${podman_version} is too old. Please upgrade to 4.0.0 or newer with 'brew upgrade podman'."
+    fi
+
+    # Check Podman machine initialization
+    if ! podman machine list --format '{{.Name}}' 2>/dev/null | grep -q "podman-machine-default"; then
+        log_info "No Podman machine found. Initializing podman-machine-default with cgroup support..."
+        podman machine init --cpus 5 --memory 2048 --disk-size 100 --cgroup-manager cgroupfs >/dev/null 2>&1 || log_error "Failed to initialize Podman machine. Run 'podman machine init --cgroup-manager cgroupfs' manually and check for errors."
+    fi
+
+    # Check Podman machine status
+    if ! podman machine list --format '{{.Running}}' 2>/dev/null | grep -q true; then
+        log_info "Podman machine is not running. Starting podman-machine-default..."
+        podman machine start >/dev/null 2>&1 || log_error "Failed to start Podman machine. Run 'podman machine start' manually and check for errors."
+        sleep 5
+    fi
+
+    # Verify and set Podman connection
+    log_info "Checking Podman connections..."
+    podman system connection list 2>&1 | tee -a "${LOG_FILE}"
+    if ! podman system connection list --format '{{.Name}}' 2>/dev/null | grep -q "podman-machine-default"; then
+        log_error "No podman-machine-default connection found. Run 'podman system connection list' and set default with 'podman system connection default podman-machine-default'."
+    fi
+    podman system connection default podman-machine-default >/dev/null 2>&1 || log_error "Failed to set podman-machine-default as default connection."
+
+    # Get Podman socket path dynamically with retries
+    local podman_socket=""
+    local retries=3
+    local wait=3
+    for ((i=1; i<=retries; i++)); do
+        podman_socket=$(podman machine inspect podman-machine-default --format '{{.ConnectionInfo.PodmanSocket.Path}}' 2>/dev/null || echo "")
+        if [ -n "${podman_socket}" ] && [ -S "${podman_socket}" ]; then
+            log_info "Podman socket found at ${podman_socket}"
+            break
+        fi
+        log_info "Attempt $i/$retries: Podman socket not found. Starting system service and retrying in ${wait}s..."
+        podman system service --timeout=0 >/dev/null 2>&1 || podman system service >/dev/null 2>&1 &
+        sleep ${wait}
+        if [ $i -eq ${retries} ]; then
+            podman_socket="/var/folders/5n/03y3qk412l10xzcylyd71t9c0000gp/T/podman/podman-machine-default-api.sock"
+            if [ ! -S "${podman_socket}" ]; then
+                log_error "Podman socket ${podman_socket} not found after retries. Ensure Podman machine is running ('podman machine start'), verify connection ('podman system connection list'), and check 'podman machine inspect podman-machine-default'."
+            fi
+        fi
+    done
+    log_info "Podman socket confirmed at ${podman_socket}"
+    PODMAN_SOCKET="${podman_socket}"
 }
 
 check_git_credentials() {
     log_info "Checking Git credentials for ${GITOPS_REMOTE_URL}..."
-    git ls-remote "${GITOPS_REMOTE_URL}" >/dev/null 2>&1 || {
-        log_error "Failed to access ${GITOPS_REMOTE_URL}. Ensure you have write access and Git credentials configured.\n" \
-                  "1. For HTTPS: Set up a personal access token (https://github.com/settings/tokens) and configure it with 'git config --global credential.helper osxkeychain'.\n" \
-                  "2. For SSH: Ensure your SSH key is added to your GitHub account (https://github.com/settings/keys) and loaded in your SSH agent ('ssh-add')."
-    }
+    if ! git config --global credential.helper | grep -q "osxkeychain"; then
+        log_info "Configuring macOS keychain for Git credentials..."
+        git config --global credential.helper osxkeychain || log_error "Failed to configure Git credential helper."
+    fi
+    if ! git ls-remote "${GITOPS_REMOTE_URL}" >/dev/null 2>&1; then
+        log_error "Failed to access ${GITOPS_REMOTE_URL}. Ensure you have a fine-grained personal access token (PAT) with write access.\n" \
+                  "Steps to create a PAT:\n" \
+                  "1. Go to https://github.com/settings/tokens?type=beta and click 'Generate new token'.\n" \
+                  "2. Select 'Fine-grained token', name it, and set permissions: 'Contents' (read and write) for repository access.\n" \
+                  "3. Generate the token and copy it.\n" \
+                  "4. Run the script again; when prompted, enter your GitHub username and the PAT as the password.\n" \
+                  "5. The PAT will be cached in macOS keychain for future use."
+    fi
 }
 
 # --- Check Existing Resources ---
 check_existing_resources() {
-    log_info "Checking existing resources for idempotency..."
-
-    # Check K3s
-    if [ -f "${K3S_BIN_DIR}/k3s" ]; then
+log_info "Checking existing resources for idempotency..."
+    if [ -f "${K3S_BIN_DIR}/kubectl" ] && [ -f "${K3S_CONFIG_DIR}/kubeconfig.yaml" ]; then
         if "${K3S_BIN_DIR}/kubectl" --kubeconfig="${K3S_CONFIG_DIR}/kubeconfig.yaml" get nodes >/dev/null 2>&1; then
             log_info "K3s is already running."
         else
-            log_warn "K3s binary found but cluster is not running. Attempting to start..."
+            log_warn "K3s kubectl found but cluster is not running. Attempting to start..."
+            # Attempt to restart Podman machine to ensure cgroup support
+            podman machine stop >/dev/null 2>&1
+            podman machine start >/dev/null 2>&1 || log_error "Failed to restart Podman machine."
+            sleep 5
         fi
     fi
-
-    # Check Helm releases
+    if command -v kubectl >/dev/null 2>&1; then
+        local kubectl_version
+        kubectl_version=$(kubectl version --client --output=json | grep -o '"gitVersion": "[^"]*"' | cut -d'"' -f4)
+        if [[ "${kubectl_version}" =~ ^v1\.(28|29|30|31|32|33)\. ]]; then
+            log_info "kubectl ${kubectl_version} is compatible (v1.28.x-v1.33.x)."
+        else
+            log_warn "kubectl ${kubectl_version} is not within v1.28.x-v1.33.x. May cause compatibility issues."
+        fi
+    fi
+    if command -v helm >/dev/null 2>&1 && helm version --short | grep -q "${HELM_VERSION}"; then
+        log_info "Helm ${HELM_VERSION} is already installed."
+    fi
     if command -v helm >/dev/null 2>&1 && [ -f "${K3S_CONFIG_DIR}/kubeconfig.yaml" ]; then
         helm --kubeconfig="${K3S_CONFIG_DIR}/kubeconfig.yaml" list -A | grep -q kamaji && log_info "Kamaji Helm release already exists."
         helm --kubeconfig="${K3S_CONFIG_DIR}/kubeconfig.yaml" list -A | grep -q argocd && log_info "ArgoCD Helm release already exists."
@@ -101,13 +172,9 @@ check_existing_resources() {
         [ "${INSTALL_METALLB}" = true ] && helm --kubeconfig="${K3S_CONFIG_DIR}/kubeconfig.yaml" list -A | grep -q metallb && log_info "MetalLB Helm release already exists."
         helm --kubeconfig="${K3S_CONFIG_DIR}/kubeconfig.yaml" list -A | grep -q sveltos && log_info "Sveltos Helm release already exists."
     fi
-
-    # Check GitOps repo
     if [ -d "${GITOPS_REPO_DIR}/.git" ]; then
         log_info "GitOps repository already exists at ${GITOPS_REPO_DIR}."
     fi
-
-    # Check ArgoCD Application
     if [ -f "${K3S_CONFIG_DIR}/kubeconfig.yaml" ] && "${K3S_BIN_DIR}/kubectl" --kubeconfig="${K3S_CONFIG_DIR}/kubeconfig.yaml" get application -n argocd "${ARGOCD_APP_NAME}" >/dev/null 2>&1; then
         log_info "ArgoCD Application '${ARGOCD_APP_NAME}' already exists."
     fi
@@ -116,9 +183,8 @@ check_existing_resources() {
 # --- Setup Directories ---
 setup_directories() {
     log_info "Creating installation directories..."
-    mkdir -p "${INSTALL_DIR}" "${K3S_BIN_DIR}" "${K3S_CONFIG_DIR}" || log_error "Failed to create directories."
-    touch "${LOG_FILE}" || log_error "Failed to create log file."
-    # Ensure GitOps repo directory is readable/writable
+    mkdir -p "${INSTALL_DIR}" "${K3S_BIN_DIR}" "${K3S_CONFIG_DIR}" "${K3S_DATA_DIR}" || log_error "Failed to create directories."
+    chmod 700 "${K3S_CONFIG_DIR}" "${K3S_DATA_DIR}" || log_error "Failed to set directory permissions."
     [ -d "${GITOPS_REPO_DIR}" ] && chmod -R u+rwX "${GITOPS_REPO_DIR}" || true
 }
 
@@ -126,62 +192,93 @@ setup_directories() {
 install_dependencies() {
     log_info "Checking and installing dependencies..."
     check_command brew
-    for cmd in curl git kubectl helm; do
+    for cmd in curl git; do
         if ! command -v "${cmd}" >/dev/null 2>&1; then
             log_info "Installing ${cmd} via Homebrew..."
             brew install "${cmd}" || log_error "Failed to install ${cmd}."
         fi
     done
-
-    # Ensure kubectl matches K3s version
-    if ! kubectl version --client --output=json | grep -q "${KUBECTL_VERSION}"; then
+    if ! command -v kubectl >/dev/null 2>&1; then
         log_info "Installing kubectl ${KUBECTL_VERSION}..."
         curl -LO "https://dl.k8s.io/release/${KUBECTL_VERSION}/bin/darwin/arm64/kubectl" || log_error "Failed to download kubectl."
         chmod +x kubectl
+        mkdir -p "${K3S_BIN_DIR}" || log_error "Failed to create ${K3S_BIN_DIR}."
         mv kubectl "${K3S_BIN_DIR}/kubectl" || log_error "Failed to install kubectl."
+    else
+        local kubectl_version
+        kubectl_version=$(kubectl version --client --output=json | grep -o '"gitVersion": "[^"]*"' | cut -d'"' -f4)
+        if [[ ! "${kubectl_version}" =~ ^v1\.(28|29|30|31|32|33)\. ]]; then
+            log_info "Installing kubectl ${KUBECTL_VERSION} due to incompatible version ${kubectl_version}..."
+            curl -LO "https://dl.k8s.io/release/${KUBECTL_VERSION}/bin/darwin/arm64/kubectl" || log_error "Failed to download kubectl."
+            chmod +x kubectl
+            mkdir -p "${K3S_BIN_DIR}" || log_error "Failed to create ${K3S_BIN_DIR}."
+            mv kubectl "${K3S_BIN_DIR}/kubectl" || log_error "Failed to install kubectl."
+        else
+            log_info "kubectl ${kubectl_version} is already installed at $(which kubectl)."
+        fi
     fi
-
-    # Ensure Helm is installed
-    if ! helm version --short | grep -q "${HELM_VERSION}"; then
+    if ! command -v helm >/dev/null 2>&1; then
         log_info "Installing Helm ${HELM_VERSION}..."
         curl -LO "https://get.helm.sh/helm-${HELM_VERSION}-darwin-arm64.tar.gz" || log_error "Failed to download Helm."
         tar -zxvf helm-${HELM_VERSION}-darwin-arm64.tar.gz
+        mkdir -p "${K3S_BIN_DIR}" || log_error "Failed to create ${K3S_BIN_DIR}."
         mv darwin-arm64/helm "${K3S_BIN_DIR}/helm" || log_error "Failed to install Helm."
         rm -rf helm-${HELM_VERSION}-darwin-arm64.tar.gz darwin-arm64
+    else
+        local helm_version
+        helm_version=$(helm version --short | grep -o 'v[0-9]\+\.[0-9]\+\.[0-9]\+' || echo "")
+        if [[ "${helm_version}" != "${HELM_VERSION}" ]]; then
+            log_info "Installing Helm ${HELM_VERSION} due to version mismatch (found ${helm_version})..."
+            curl -LO "https://get.helm.sh/helm-${HELM_VERSION}-darwin-arm64.tar.gz" || log_error "Failed to download Helm."
+            tar -zxvf helm-${HELM_VERSION}-darwin-arm64.tar.gz
+            mkdir -p "${K3S_BIN_DIR}" || log_error "Failed to create ${K3S_BIN_DIR}."
+            mv darwin-arm64/helm "${K3S_BIN_DIR}/helm" || log_error "Failed to install Helm."
+            rm -rf helm-${HELM_VERSION}-darwin-arm64.tar.gz darwin-arm64
+        else
+            log_info "Helm ${helm_version} is already installed at $(which helm)."
+        fi
     fi
 }
 
 # --- Install K3s with Podman ---
 install_k3s() {
-    if [ -f "${K3S_BIN_DIR}/k3s" ] && "${K3S_BIN_DIR}/kubectl" --kubeconfig="${K3S_CONFIG_DIR}/kubeconfig.yaml" get nodes >/dev/null 2>&1; then
+    if [ -f "${K3S_BIN_DIR}/kubectl" ] && [ -f "${K3S_CONFIG_DIR}/kubeconfig.yaml" ] && "${K3S_BIN_DIR}/kubectl" --kubeconfig="${K3S_CONFIG_DIR}/kubeconfig.yaml" get nodes >/dev/null 2>&1; then
         log_info "K3s is already installed and running. Skipping installation."
         return
     fi
-
-    log_info "Installing K3s ${K3S_VERSION}..."
+    log_info "Installing K3s ${K3S_VERSION} as a Podman container..."
     export PATH="${K3S_BIN_DIR}:${PATH}"
-    export K3S_KUBECONFIG_OUTPUT="${K3S_CONFIG_DIR}/kubeconfig.yaml"
-    export K3S_KUBECONFIG_MODE="644"
-    export INSTALL_K3S_VERSION="${K3S_VERSION}"
-    export INSTALL_K3S_BIN_DIR="${K3S_BIN_DIR}"
-    export INSTALL_K3S_EXEC="${K3S_EXEC}"
-    export CONTAINER_RUNTIME_ENDPOINT="unix:///var/run/podman/podman.sock"
-
-    # Download K3s install script
-    curl -sfL https://get.k3s.io > "${INSTALL_DIR}/install.sh" || log_error "Failed to download K3s install script."
-    chmod +x "${INSTALL_DIR}/install.sh"
-
-    # Modify install.sh for Podman and non-root
-    sed -i '' 's/sudo //g' "${INSTALL_DIR}/install.sh"
-    sed -i '' 's|/usr/local/bin|'"${K3S_BIN_DIR}"'|g' "${INSTALL_DIR}/install.sh"
-    sed -i '' 's|/etc/systemd/system|'"${K3S_CONFIG_DIR}"'|g' "${INSTALL_DIR}/install.sh"
-
-    # Run K3s install
-    sh "${INSTALL_DIR}/install.sh" || log_error "K3s installation failed."
-
-    # Verify K3s is running
-    sleep 10
-    "${K3S_BIN_DIR}/kubectl" --kubeconfig="${K3S_CONFIG_DIR}/kubeconfig.yaml" get nodes || log_error "K3s cluster not running."
+    mkdir -p "${K3S_CONFIG_DIR}" "${K3S_DATA_DIR}" || log_error "Failed to create K3s directories."
+    chmod 700 "${K3S_CONFIG_DIR}" "${K3S_DATA_DIR}"
+    if podman ps -a --format '{{.Names}}' | grep -q "^k3s-server$"; then
+        log_info "Removing existing K3s container..."
+        podman rm -f k3s-server >/dev/null 2>&1
+    fi
+    podman rm -f k3s-server
+    rm -rf ~/.rancher/k3s/*
+    podman run -d --name k3s-server \
+        --privileged \
+        --cgroupns=host \
+        -v "${K3S_DATA_DIR}:/var/lib/rancher/k3s" \
+        -v "${K3S_CONFIG_DIR}:/etc/rancher/k3s" \
+        -e K3S_KUBECONFIG_OUTPUT=/etc/rancher/k3s/kubeconfig.yaml \
+        -e K3S_KUBECONFIG_MODE=644 \
+        -p 6443:6443 \
+        docker.io/rancher/k3s:${K3S_VERSION} \
+        ${K3S_EXEC}|| log_error "Failed to start K3s container."
+    sleep 30
+    if [ ! -f "${K3S_CONFIG_DIR}/kubeconfig.yaml" ]; then
+        log_error "Kubeconfig not found at ${K3S_CONFIG_DIR}/kubeconfig.yaml."
+    fi
+    sed -i '' "s/0.0.0.0:6443/127.0.0.1:6443/g" "${K3S_CONFIG_DIR}/kubeconfig.yaml" || log_error "Failed to update kubeconfig."
+    chmod 600 "${K3S_CONFIG_DIR}/kubeconfig.yaml" || log_error "Failed to set kubeconfig permissions."
+    if ! "${K3S_BIN_DIR}/kubectl" --kubeconfig="${K3S_CONFIG_DIR}/kubeconfig.yaml" get nodes >/dev/null 2>&1; then
+        log_info "K3s container status:"
+        podman ps -a --filter name=k3s-server | tee -a "${LOG_FILE}"
+        log_info "K3s container logs:"
+        podman logs k3s-server 2>&1 | tee -a "${LOG_FILE}"
+        log_error "K3s cluster not running. Check container logs above and ${LOG_FILE}."
+    fi
     log_info "K3s installed successfully."
 }
 
@@ -199,6 +296,11 @@ setup_helm_repos() {
 }
 
 # --- Install Tools ---
+install_calico() {
+    kubectl --kubeconfig="${K3S_CONFIG_DIR}/kubeconfig.yaml" apply -f https://docs.projectcalico.org/manifests/calico.yaml
+    sleep 60
+}
+
 install_kamaji() {
     log_info "Installing or updating Kamaji..."
     helm upgrade --install kamaji clastix/kamaji --version "${KAMAJI_VERSION}" -n kamaji --create-namespace \
@@ -214,19 +316,14 @@ install_argocd() {
     if [ "${INSTALL_METALLB}" = true ]; then
         service_type="LoadBalancer"
     fi
-
     helm upgrade --install argocd argo/argo-cd --version "${ARGOCD_VERSION}" -n argocd --create-namespace \
         --set crds.install=true \
         --set server.service.type="${service_type}" \
         --set server.resources.requests.cpu="50m" \
         --set server.resources.requests.memory="64Mi" \
         --kubeconfig="${K3S_CONFIG_DIR}/kubeconfig.yaml" || log_error "ArgoCD installation failed."
-
-    # Retrieve ArgoCD admin password
     local admin_password
     admin_password=$("${K3S_BIN_DIR}/kubectl" --kubeconfig="${K3S_CONFIG_DIR}/kubeconfig.yaml" -n argocd get secret argocd-initial-admin-secret -o jsonpath='{.data.password}' | base64 -d 2>/dev/null) || log_warn "Failed to retrieve ArgoCD admin password. Secret may not be ready yet."
-
-    # Log access instructions
     if [ -n "${admin_password}" ]; then
         log_info "ArgoCD admin credentials: username=admin, password=${admin_password}"
     fi
@@ -253,14 +350,11 @@ install_metallb() {
         log_info "Skipping MetalLB installation (INSTALL_METALLB=false)."
         return
     fi
-
     log_info "Installing or updating MetalLB..."
     helm upgrade --install metallb metallb/metallb --version "${METALLB_VERSION}" -n metallb-system --create-namespace \
         --set controller.resources.requests.cpu="50m" \
         --set controller.resources.requests.memory="64Mi" \
         --kubeconfig="${K3S_CONFIG_DIR}/kubeconfig.yaml" || log_error "MetalLB installation failed."
-
-    # Apply MetalLB IP pool
     log_info "Applying MetalLB IP pool: ${METALLB_IP_POOL}"
     cat <<EOF | "${K3S_BIN_DIR}/kubectl" --kubeconfig="${K3S_CONFIG_DIR}/kubeconfig.yaml" apply -f -
 apiVersion: metallb.io/v1beta1
@@ -295,8 +389,6 @@ install_sveltos() {
 setup_gitops_repo() {
     log_info "Setting up GitOps repository for ${GITOPS_REMOTE_URL}..."
     check_git_credentials
-
-    # Check if local repo exists
     if [ -d "${GITOPS_REPO_DIR}/.git" ]; then
         log_info "GitOps repository already exists at ${GITOPS_REPO_DIR}. Pulling latest changes..."
         cd "${GITOPS_REPO_DIR}"
@@ -304,9 +396,9 @@ setup_gitops_repo() {
         git checkout "${GITOPS_BRANCH}" || git checkout -b "${GITOPS_BRANCH}"
         git pull origin "${GITOPS_BRANCH}" --rebase || log_warn "No changes pulled from ${GITOPS_REMOTE_URL}."
     else
-        # Clone or initialize the repository
         if git ls-remote "${GITOPS_REMOTE_URL}" >/dev/null 2>&1; then
             log_info "Cloning existing repository from ${GITOPS_REMOTE_URL}..."
+            mkdir -p "${INSTALL_DIR}"
             git clone "${GITOPS_REMOTE_URL}" "${GITOPS_REPO_DIR}" || log_error "Failed to clone ${GITOPS_REMOTE_URL}."
             cd "${GITOPS_REPO_DIR}"
             git checkout "${GITOPS_BRANCH}" || git checkout -b "${GITOPS_BRANCH}"
@@ -319,11 +411,14 @@ setup_gitops_repo() {
             git checkout -b "${GITOPS_BRANCH}"
         fi
     fi
-
-    # Create directory structure if not exists
     mkdir -p documentation infra-setup/{metal3,metallb,crossplane-provider} kamaji-clusters base-addons demos/{f5-bnk,f5-spk,other-products} clusters-apps/{example-app1,example-app2} scripts || log_error "Failed to create GitOps repo structure."
-
-    # Create basic README if not exists
+    if [ ! -f .gitignore ]; then
+        cat <<EOF > .gitignore
+# Ignore K3s setup artifacts
+${INSTALL_DIR#/Users/*/}
+*.log
+EOF
+    fi
     if [ ! -f README.md ]; then
         cat <<EOF > README.md
 # Multi-Tenant Kubernetes Demo Platform
@@ -331,15 +426,11 @@ This repository provides a GitOps-driven platform for managing multiple Kubernet
 See documentation/ for quickstart guides.
 EOF
     fi
-
-    # Create placeholder quickstart docs if not exists
     for env in laptop onprem cloud; do
         if [ ! -f "documentation/quickstart-${env}.md" ]; then
             echo "# Quickstart for ${env} environment" > "documentation/quickstart-${env}.md"
         fi
     done
-
-    # Create placeholder tenant manifests if not exists
     if [ ! -f kamaji-clusters/tenant-laptop-demo.yaml ]; then
         cat <<EOF > kamaji-clusters/tenant-laptop-demo.yaml
 apiVersion: kamaji.clastix.io/v1alpha1
@@ -353,8 +444,6 @@ spec:
   serviceType: ${INSTALL_METALLB:+LoadBalancer}${INSTALL_METALLB:-NodePort}
 EOF
     fi
-
-    # Create bootstrap script placeholder if not exists
     if [ ! -f scripts/bootstrap-laptop.sh ]; then
         cat <<EOF > scripts/bootstrap-laptop.sh
 #!/bin/bash
@@ -363,14 +452,12 @@ echo "Bootstrap script for laptop environment"
 EOF
         chmod +x scripts/bootstrap-laptop.sh
     fi
-
-    # Commit and push changes
     git add . >/dev/null 2>&1
     if git diff --cached --quiet; then
         log_info "No changes to commit in GitOps repository."
     else
         git commit -m "Update GitOps repository structure" || log_warn "No changes to commit."
-        git push -u origin "${GITOPS_BRANCH}" || log_error "Failed to push to ${GITOPS_REMOTE_URL}. Ensure Git credentials are configured."
+        git push -u origin "${GITOPS_BRANCH}" || log_error "Failed to push to ${GITOPS_REMOTE_URL}. Ensure your PAT is cached in macOS keychain."
         log_info "GitOps repository updated and pushed to ${GITOPS_REMOTE_URL}."
     fi
     cd - >/dev/null
@@ -382,7 +469,6 @@ configure_argocd_gitops() {
     if "${K3S_BIN_DIR}/kubectl" --kubeconfig="${K3S_CONFIG_DIR}/kubeconfig.yaml" get application -n argocd "${ARGOCD_APP_NAME}" >/dev/null 2>&1; then
         log_info "ArgoCD Application '${ARGOCD_APP_NAME}' already exists. Updating configuration..."
     fi
-
     cat <<EOF | "${K3S_BIN_DIR}/kubectl" --kubeconfig="${K3S_CONFIG_DIR}/kubeconfig.yaml" apply -f -
 apiVersion: argoproj.io/v1alpha1
 kind: Application
@@ -411,38 +497,23 @@ EOF
 # --- Main Execution ---
 main() {
     log_info "Starting bootstrap-laptop.sh on MacBook Pro M1 (MetalLB: ${INSTALL_METALLB})..."
-
-    # Check existing resources
     check_existing_resources
-
-    # Check Podman and dependencies
     check_podman
     install_dependencies
     setup_directories
-
-    # Install K3s
     install_k3s
-
-    # Setup Helm repositories
     setup_helm_repos
-
-    # Install tools
+    install_calico
     install_kamaji
     install_argocd
     install_crossplane
     install_metallb
     install_sveltos
-
-    # Setup GitOps repository
     setup_gitops_repo
-
-    # Configure ArgoCD to watch GitOps repo
     configure_argocd_gitops
-
     log_info "Bootstrap completed successfully! K3s cluster is running, tools are installed, and GitOps repo is set up at ${GITOPS_REPO_DIR}."
     log_info "Kubeconfig is available at ${K3S_CONFIG_DIR}/kubeconfig.yaml"
-
-    # Provide access instructions
+    log_info "Logs are available at ${LOG_FILE}"
     local admin_password
     admin_password=$("${K3S_BIN_DIR}/kubectl" --kubeconfig="${K3S_CONFIG_DIR}/kubeconfig.yaml" -n argocd get secret argocd-initial-admin-secret -o jsonpath='{.data.password}' | base64 -d 2>/dev/null) || log_warn "Failed to retrieve ArgoCD admin password. Secret may not be ready yet."
     if [ -n "${admin_password}" ]; then
@@ -454,7 +525,7 @@ main() {
     else
         local node_port
         node_port=$("${K3S_BIN_DIR}/kubectl" --kubeconfig="${K3S_CONFIG_DIR}/kubeconfig.yaml" -n argocd get svc argocd-server -o jsonpath='{.spec.ports[0].nodePort}' 2>/dev/null) || log_warn "Failed to retrieve ArgoCD NodePort. Service may not be ready yet."
-        [ -n "${node_port}" ] && log_info "ArgoCD is configured with NodePort. Access it at http://localhost:${node_port}"
+        [ -n "${node_port}" ] && log_info "ArgoCD is using NodePort. Access it at http://localhost:${node_port}"
     fi
     log_info "ArgoCD is watching ${GITOPS_REMOTE_URL}/${ARGOCD_GITOPS_PATH} (branch: ${GITOPS_BRANCH}) for tenant cluster definitions."
     log_info "Next steps: Add F5 BNK/SPK manifests to ${GITOPS_REPO_DIR}/demos/ and push to ${GITOPS_REMOTE_URL}."
