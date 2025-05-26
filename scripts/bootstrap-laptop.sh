@@ -4,52 +4,51 @@
 # Sets up a K3s management cluster on a MacBook Pro M1 using Lima for a multi-tenant demo environment.
 # Compatible with arm64 architecture, runs without sudo, includes optional MetalLB support, and configures ArgoCD to watch a remote GitOps repo.
 # Forces a clean environment on each run by removing existing Lima VM and K3s artifacts.
-# Uses GitHub fine-grained personal access token (PAT) for HTTPS access to https://github.com/JLCode-tech/build-demo-tooling.git.
-# Avoids creating files in the build-demo-tooling repository and adds .gitignore entries for setup artifacts.
+# Uses GitHub fine-grained PAT for HTTPS access to https://github.com/JLCode-tech/build-demo-repo.git
+# Avoids running files that require sudo and adds .gitignore entries for artifacts.
 # Relaxes kubectl version requirement to v1.28.x-v1.33.x for flexibility.
-# Runs K3s inside a Lima VM on macOS with user-mode networking (user-v2) to avoid sudo, and includes a progress bar for downloading the Ubuntu image.
+# Uses user-v2 networking to avoid socket_vmnet, includes a progress bar for downloading the Ubuntu image, and ensures VM permissions are correctly set.
 
 set -euo pipefail
 
 # --- Configuration Variables ---
-# Installation paths and versions
 INSTALL_DIR="${HOME}/.k3s-demo"
-K3S_VERSION="${K3S_VERSION:-v1.29.4+k3s1}" # Stable version as of May 2025
-HELM_VERSION="v3.15.4" # Stable Helm version
-KUBECTL_VERSION="v1.29.4" # Preferred kubectl version
-ARGOCD_VERSION="2.12.5" # ArgoCD Helm chart version
-KAMAJI_VERSION="0.5.0" # Kamaji Helm chart version
-CROSSPLANE_VERSION="1.16.0" # Crossplane Helm chart version
-METALLB_VERSION="0.14.5" # MetalLB Helm chart version
-SVELTOS_VERSION="0.24.0" # Sveltos Helm chart version
+K3S_VERSION="${K3S_VERSION:-v1.29.2+k3s1}" # Adjusted to a stable version
+HELM_VERSION="v3.14.3" # Stable Helm version
+KUBECTL_VERSION="v1.29.2" # Preferred kubectl version
+ARGOCD_VERSION="2.10.2" # ArgoCD Helm chart version
+KAMAJI_VERSION="0.4.0" # Kamaji Helm chart version
+CROSSPLANE_VERSION="1.15.0" # Crossplane Helm version
+METALLB_VERSION="0.14.3" # MetalLB Helm version
+SVELTES_VERSION="0.28.0" # Sveltos Helm version
 GITOPS_REPO_DIR="${INSTALL_DIR}/demo-environment-gitops"
-LOG_FILE="/tmp/bootstrap-k3s-$(date +%s).log" # Temporary log file
+LOG_FILE="/tmp/bootstrap-k3s-$(date +%s).log"
 LIMA_VM_NAME="k3s-demo-vm"
 LIMA_VM_DIR="${HOME}/.lima/${LIMA_VM_NAME}"
 IMAGE_URL="https://cloud-images.ubuntu.com/noble/current/noble-server-cloudimg-arm64.img"
 IMAGE_PATH="${INSTALL_DIR}/noble-server-cloudimg-arm64.img"
 
 # MetalLB configuration
-INSTALL_METALLB="${INSTALL_METALLB:-false}" # Set to true to enable MetalLB, false for NodePort
-METALLB_IP_POOL="${METALLB_IP_POOL:-192.168.1.240/28}" # IP range for MetalLB LoadBalancer
+INSTALL_METALLB="${INSTALL_METALLB:-false}"
+METALLB_IP_POOL="192.168.105.240/28"
 
-# K3s specific settings for Lima VM
+# K3s settings
 K3S_BIN_DIR="${INSTALL_DIR}/bin"
 K3S_CONFIG_DIR="${INSTALL_DIR}/config"
 K3S_DATA_DIR="${HOME}/.rancher/k3s"
 K3S_EXEC="server --disable=traefik --disable-network-policy --flannel-backend=vxlan --data-dir=/var/lib/rancher/k3s"
 
-# ArgoCD GitOps configuration
+# ArgoCD settings
 ARGOCD_APP_NAME="gitops-demo"
 ARGOCD_GITOPS_PATH="kamaji-clusters"
-GITOPS_REMOTE_URL="https://github.com/JLCode-tech/build-demo-tooling.git"
+GITOPS_REMOTE_URL="https://github.com/JLCode-tech/build-demo.gitlab"
 GITOPS_BRANCH="main"
 
 # --- Color Codes ---
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
-NC='\033[0m' # No Color
+NC='\033[0m'
 
 # --- Logging Functions ---
 log_info() {
@@ -83,37 +82,31 @@ check_lima() {
 # --- Reset Environment ---
 reset_environment() {
     log_info "Resetting environment for a clean setup..."
-    # Stop and delete Lima VM if it exists
     if limactl list --format '{{.Name}}' 2>/dev/null | grep -q "${LIMA_VM_NAME}"; then
         log_info "Stopping and deleting existing Lima VM '${LIMA_VM_NAME}'..."
         limactl stop --force "${LIMA_VM_NAME}" 2>&1 | tee -a "${LOG_FILE}" || log_warn "Failed to force-stop Lima VM '${LIMA_VM_NAME}'. Continuing..."
         limactl delete "${LIMA_VM_NAME}" 2>&1 | tee -a "${LOG_FILE}" || log_warn "Failed to delete Lima VM '${LIMA_VM_NAME}'. Continuing..."
     fi
-    # Remove K3s data, configuration directories, and image
     log_info "Removing K3s data, configuration directories, and image..."
-    rm -rf "${K3S_DATA_DIR}" "${K3S_CONFIG_DIR}" "${K3S_BIN_DIR}" "${INSTALL_DIR}/lima-config.yaml" "${IMAGE_PATH}" || log_warn "Failed to remove some K3s directories or image. Continuing..."
-    # Ensure GitOps repo directory is not removed to preserve user data
+    rm -rf "${K3S_DATA_DIR}" "${K3S_CONFIG_DIR}" "${K3S_BIN_DIR}" "${INSTALL_DIR}/lima-config.yaml" "${IMAGE_PATH}" "${INSTALL_DIR}/user-data" || log_warn "Failed to remove some K3s directories or image. Continuing..."
     log_info "Environment reset complete."
 }
 
 # --- Validate Prerequisites ---
 validate_prerequisites() {
     log_info "Validating prerequisites..."
-    # Check disk space (need at least 20GB free)
     local free_space
     free_space=$(df -g / | tail -1 | awk '{print $4}')
     if [ "${free_space}" -lt 20 ]; then
         log_error "Insufficient disk space. Need at least 20GB free, found ${free_space}GB."
     fi
     log_info "Disk space check passed: ${free_space}GB available."
-    # Check network connectivity for Ubuntu image
     if ! curl -s -I "${IMAGE_URL}" >/dev/null; then
         log_error "Failed to access Ubuntu Noble image at ${IMAGE_URL}. Check your network connection."
     fi
     log_info "Network connectivity check passed."
-    # Warn if socket_vmnet is running (unnecessary with user-v2 networking)
     if brew services list | grep -q "socket_vmnet.*started"; then
-        log_warn "socket_vmnet service is running but not needed with user-v2 networking. You can stop it with 'brew services stop socket_vmnet' if you have sudo access."
+        log_warn "socket_vmnet service is running but not needed with user-v2 networking."
     fi
 }
 
@@ -121,14 +114,11 @@ validate_prerequisites() {
 download_ubuntu_image() {
     log_info "Downloading Ubuntu Noble image with progress bar..."
     mkdir -p "${INSTALL_DIR}"
-    # Try downloading with curl and progress bar, with up to 3 retries
     for attempt in {1..3}; do
         log_info "Download attempt ${attempt}/3..."
         if command -v pv >/dev/null 2>&1; then
-            # Use pv if available for a detailed progress bar
             curl -sL "${IMAGE_URL}" | pv -p -b -r -t -e -N "Downloading ${IMAGE_URL}" > "${IMAGE_PATH}" && break
         else
-            # Fallback to curl with built-in progress bar
             echo "Downloading ${IMAGE_URL}..."
             curl -L "${IMAGE_URL}" --progress-bar -o "${IMAGE_PATH}" 2>&1 | tee -a "${LOG_FILE}" && break
         fi
@@ -139,7 +129,6 @@ download_ubuntu_image() {
             log_error "Failed to download Ubuntu Noble image after 3 attempts. Check ${LOG_FILE} for details."
         fi
     done
-    # Verify the image file exists and is non-empty
     if [ ! -s "${IMAGE_PATH}" ]; then
         log_error "Downloaded image at ${IMAGE_PATH} is missing or empty."
     fi
@@ -150,6 +139,19 @@ download_ubuntu_image() {
 manage_lima_vm() {
     log_info "Creating and configuring Lima VM '${LIMA_VM_NAME}'..."
     download_ubuntu_image
+    # Create user-data to configure sudo privileges for lima user
+    cat <<EOF > "${INSTALL_DIR}/user-data"
+#cloud-config
+users:
+  - name: lima
+    sudo: ALL=(ALL) NOPASSWD:ALL
+    shell: /bin/bash
+write_files:
+  - path: /etc/sudoers.d/lima
+    content: |
+      lima ALL=(ALL) NOPASSWD:ALL
+    permissions: '0440'
+EOF
     cat <<EOF > "${INSTALL_DIR}/lima-config.yaml"
 arch: aarch64
 images:
@@ -172,13 +174,26 @@ networks:
 portForwards:
   - guestPort: 6443
     hostPort: 6443
+provision:
+  - mode: system
+    script: |
+      #!/bin/bash
+      mkdir -p /var/lib/rancher/k3s /etc/rancher/k3s
+      chmod -R 777 /var/lib/rancher/k3s /etc/rancher/k3s
+userData: ${INSTALL_DIR}/user-data
 EOF
+    # Log the effective configuration
+    log_info "Lima VM configuration:"
+    cat "${INSTALL_DIR}/lima-config.yaml" >> "${LOG_FILE}"
     limactl create --name "${LIMA_VM_NAME}" "${INSTALL_DIR}/lima-config.yaml" 2>&1 | tee -a "${LOG_FILE}" || log_error "Failed to create Lima VM '${LIMA_VM_NAME}'. Check ${LOG_FILE} for details and run 'limactl create --name ${LIMA_VM_NAME} ${INSTALL_DIR}/lima-config.yaml' manually."
-    limactl start "${LIMA_VM_NAME}" 2>&1 | tee -a "${LOG_FILE}" || log_error "Failed to start Lima VM '${LIMA_VM_NAME}'. Check ${LOG_FILE} for details and run 'limactl start ${LIMA_VM_NAME}' manually."
+    limactl start "${LIMA_VM_NAME}" 2>&1 | tee -a "${LOG_FILE}" || log_error "Failed to start Lima VM '${LIMA_VM_NAME}'. Check ${LOG_FILE} and '/Users/j.lucia/.lima/k3s-demo-vm/ha.stderr.log' for details and run 'limactl start ${LIMA_VM_NAME}' manually."
     log_info "Lima VM '${LIMA_VM_NAME}' is running."
-    # Ensure K3s data directories are accessible in the VM
-    limactl shell "${LIMA_VM_NAME}" sudo mkdir -p /var/lib/rancher/k3s /etc/rancher/k3s >/dev/null 2>&1
-    limactl shell "${LIMA_VM_NAME}" sudo chmod -R 777 /var/lib/rancher/k3s /etc/rancher/k3s >/dev/null 2>&1
+    # Attempt to create directories with sudo, with fallback
+    if ! limactl shell "${LIMA_VM_NAME}" sudo mkdir -p /var/lib/rancher/k3s /etc/rancher/k3s 2>&1 | tee -a "${LOG_FILE}"; then
+        log_warn "Failed to create directories with sudo. Attempting without sudo..."
+        limactl shell "${LIMA_VM_NAME}" mkdir -p /var/lib/rancher/k3s /etc/rancher/k3s 2>&1 | tee -a "${LOG_FILE}" || log_error "Failed to create directories in VM."
+    fi
+    limactl shell "${LIMA_VM_NAME}" sudo chmod -R 777 /var/lib/rancher/k3s /etc/rancher/k3s 2>&1 | tee -a "${LOG_FILE}" || log_warn "Failed to set permissions with sudo. Continuing..."
 }
 
 # --- Setup Directories ---
@@ -199,7 +214,6 @@ install_dependencies() {
             brew install "${cmd}" || log_error "Failed to install ${cmd}."
         fi
     done
-    # Install pv for enhanced progress bar if not present
     if ! command -v pv >/dev/null 2>&1; then
         log_info "Installing pv for download progress bar..."
         brew install pv || log_warn "Failed to install pv. Falling back to curl progress bar."
@@ -252,13 +266,10 @@ install_k3s() {
     export PATH="${K3S_BIN_DIR}:${PATH}"
     mkdir -p "${K3S_CONFIG_DIR}" "${K3S_DATA_DIR}" || log_error "Failed to create K3s directories."
     chmod 700 "${K3S_CONFIG_DIR}" "${K3S_DATA_DIR}"
-    # Install dependencies in the VM
     limactl shell "${LIMA_VM_NAME}" sudo apt-get update >/dev/null 2>&1
     limactl shell "${LIMA_VM_NAME}" sudo apt-get install -y conntrack iptables >/dev/null 2>&1 || log_error "Failed to install K3s dependencies in Lima VM."
-    # Install K3s in the VM
     limactl shell "${LIMA_VM_NAME}" bash -c "curl -sfL https://get.k3s.io | INSTALL_K3S_VERSION=${K3S_VERSION} K3S_KUBECONFIG_MODE=644 sh -s - ${K3S_EXEC}" 2>&1 | tee -a "${LOG_FILE}" || log_error "Failed to install K3s in Lima VM. Check ${LOG_FILE} for details."
-    sleep 60 # Increased sleep to ensure K3s is ready
-    # Copy kubeconfig to host
+    sleep 60
     limactl copy "${LIMA_VM_NAME}:/etc/rancher/k3s/k3s.yaml" "${K3S_CONFIG_DIR}/kubeconfig.yaml" || log_error "Failed to copy kubeconfig from Lima VM."
     sed -i '' "s/0.0.0.0:6443/127.0.0.1:6443/g" "${K3S_CONFIG_DIR}/kubeconfig.yaml" || log_error "Failed to update kubeconfig."
     chmod 600 "${K3S_CONFIG_DIR}/kubeconfig.yaml" || log_error "Failed to set kubeconfig permissions."
@@ -369,7 +380,7 @@ EOF
 
 install_sveltos() {
     log_info "Installing or updating Sveltos..."
-    helm upgrade --install sveltos projectsveltos/sveltos --version "${SVELTOS_VERSION}" -n projectsveltos --create-namespace \
+    helm upgrade --install sveltos projectsveltos/sveltos --version "${SVELTES_VERSION}" -n projectsveltos --create-namespace \
         --set resources.requests.cpu="50m" \
         --set resources.requests.memory="64Mi" \
         --kubeconfig="${K3S_CONFIG_DIR}/kubeconfig.yaml" || log_error "Sveltos installation failed."
