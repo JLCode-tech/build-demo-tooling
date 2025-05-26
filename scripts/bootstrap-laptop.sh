@@ -1,21 +1,20 @@
 #!/bin/bash
 
 # bootstrap-laptop.sh
-# Sets up a K3s management cluster on a MacBook Pro M1 using Podman for a multi-tenant demo environment.
+# Sets up a K3s management cluster on a MacBook Pro M1 using Lima for a multi-tenant demo environment.
 # Compatible with arm64 architecture, runs without sudo, includes optional MetalLB support, and configures ArgoCD to watch a remote GitOps repo.
-# Idempotent: Can be run multiple times to ensure consistent state or apply updates.
+# Forces a clean environment on each run by removing existing Lima VM and K3s artifacts.
 # Uses GitHub fine-grained personal access token (PAT) for HTTPS access to https://github.com/JLCode-tech/build-demo-tooling.git.
 # Avoids creating files in the build-demo-tooling repository and adds .gitignore entries for setup artifacts.
 # Relaxes kubectl version requirement to v1.28.x-v1.33.x for flexibility.
-# Runs K3s as a Podman container on macOS to avoid systemd/openrc dependency.
-# Ensures Podman machine is initialized and running, with dynamic socket detection.
+# Runs K3s inside a Lima VM on macOS with user-mode networking (user-v2) to avoid sudo, and includes a progress bar for downloading the Ubuntu image.
 
 set -euo pipefail
 
 # --- Configuration Variables ---
 # Installation paths and versions
 INSTALL_DIR="${HOME}/.k3s-demo"
-K3S_VERSION="${K3S_VERSION:-v1.29.4-k3s1}" # Stable version as of May 2025
+K3S_VERSION="${K3S_VERSION:-v1.29.4+k3s1}" # Stable version as of May 2025
 HELM_VERSION="v3.15.4" # Stable Helm version
 KUBECTL_VERSION="v1.29.4" # Preferred kubectl version
 ARGOCD_VERSION="2.12.5" # ArgoCD Helm chart version
@@ -25,21 +24,24 @@ METALLB_VERSION="0.14.5" # MetalLB Helm chart version
 SVELTOS_VERSION="0.24.0" # Sveltos Helm chart version
 GITOPS_REPO_DIR="${INSTALL_DIR}/demo-environment-gitops"
 LOG_FILE="/tmp/bootstrap-k3s-$(date +%s).log" # Temporary log file
+LIMA_VM_NAME="k3s-demo-vm"
+LIMA_VM_DIR="${HOME}/.lima/${LIMA_VM_NAME}"
+IMAGE_URL="https://cloud-images.ubuntu.com/noble/current/noble-server-cloudimg-arm64.img"
+IMAGE_PATH="${INSTALL_DIR}/noble-server-cloudimg-arm64.img"
 
 # MetalLB configuration
 INSTALL_METALLB="${INSTALL_METALLB:-false}" # Set to true to enable MetalLB, false for NodePort
 METALLB_IP_POOL="${METALLB_IP_POOL:-192.168.1.240/28}" # IP range for MetalLB LoadBalancer
 
-# K3s specific settings for non-root Podman
+# K3s specific settings for Lima VM
 K3S_BIN_DIR="${INSTALL_DIR}/bin"
 K3S_CONFIG_DIR="${INSTALL_DIR}/config"
 K3S_DATA_DIR="${HOME}/.rancher/k3s"
-K3S_EXEC="server --disable=traefik --disable-network-policy --flannel-backend=vxlan --data-dir=${K3S_DATA_DIR}"
-#K3S_EXEC="server --disable=traefik --data-dir=${K3S_DATA_DIR} --kubelet-arg=provider-id=host://localhost"
+K3S_EXEC="server --disable=traefik --disable-network-policy --flannel-backend=vxlan --data-dir=/var/lib/rancher/k3s"
 
 # ArgoCD GitOps configuration
 ARGOCD_APP_NAME="gitops-demo"
-ARGOCD_GITOPS_PATH="kamaji-clusters" # Path to watch in the Git repo
+ARGOCD_GITOPS_PATH="kamaji-clusters"
 GITOPS_REMOTE_URL="https://github.com/JLCode-tech/build-demo-tooling.git"
 GITOPS_BRANCH="main"
 
@@ -68,116 +70,115 @@ check_command() {
     command -v "$1" >/dev/null 2>&1 || log_error "Required command '$1' not found. Please install it."
 }
 
-check_podman() {
-    podman --version >/dev/null 2>&1 || log_error "Podman is required but not installed. Install via 'brew install podman'."
-    local podman_version
-    podman_version=$(podman --version | awk '{print $3}')
-    log_info "Podman version: ${podman_version}"
-    if [[ "${podman_version}" < "4.0.0" ]]; then
-        log_error "Podman version ${podman_version} is too old. Please upgrade to 4.0.0 or newer with 'brew upgrade podman'."
+check_lima() {
+    check_command limactl
+    local lima_version
+    lima_version=$(limactl --version | awk '{print $2}')
+    log_info "Lima version: ${lima_version}"
+    if [[ "${lima_version}" < "0.17.0" ]]; then
+        log_error "Lima version ${lima_version} is too old. Please upgrade to 0.17.0 or newer with 'brew upgrade lima'."
     fi
+}
 
-    # Check Podman machine initialization
-    if ! podman machine list --format '{{.Name}}' 2>/dev/null | grep -q "podman-machine-default"; then
-        log_info "No Podman machine found. Initializing podman-machine-default with cgroup support..."
-        podman machine init --cpus 5 --memory 2048 --disk-size 100 --cgroup-manager cgroupfs >/dev/null 2>&1 || log_error "Failed to initialize Podman machine. Run 'podman machine init --cgroup-manager cgroupfs' manually and check for errors."
+# --- Reset Environment ---
+reset_environment() {
+    log_info "Resetting environment for a clean setup..."
+    # Stop and delete Lima VM if it exists
+    if limactl list --format '{{.Name}}' 2>/dev/null | grep -q "${LIMA_VM_NAME}"; then
+        log_info "Stopping and deleting existing Lima VM '${LIMA_VM_NAME}'..."
+        limactl stop --force "${LIMA_VM_NAME}" 2>&1 | tee -a "${LOG_FILE}" || log_warn "Failed to force-stop Lima VM '${LIMA_VM_NAME}'. Continuing..."
+        limactl delete "${LIMA_VM_NAME}" 2>&1 | tee -a "${LOG_FILE}" || log_warn "Failed to delete Lima VM '${LIMA_VM_NAME}'. Continuing..."
     fi
+    # Remove K3s data, configuration directories, and image
+    log_info "Removing K3s data, configuration directories, and image..."
+    rm -rf "${K3S_DATA_DIR}" "${K3S_CONFIG_DIR}" "${K3S_BIN_DIR}" "${INSTALL_DIR}/lima-config.yaml" "${IMAGE_PATH}" || log_warn "Failed to remove some K3s directories or image. Continuing..."
+    # Ensure GitOps repo directory is not removed to preserve user data
+    log_info "Environment reset complete."
+}
 
-    # Check Podman machine status
-    if ! podman machine list --format '{{.Running}}' 2>/dev/null | grep -q true; then
-        log_info "Podman machine is not running. Starting podman-machine-default..."
-        podman machine start >/dev/null 2>&1 || log_error "Failed to start Podman machine. Run 'podman machine start' manually and check for errors."
-        sleep 5
+# --- Validate Prerequisites ---
+validate_prerequisites() {
+    log_info "Validating prerequisites..."
+    # Check disk space (need at least 20GB free)
+    local free_space
+    free_space=$(df -g / | tail -1 | awk '{print $4}')
+    if [ "${free_space}" -lt 20 ]; then
+        log_error "Insufficient disk space. Need at least 20GB free, found ${free_space}GB."
     fi
-
-    # Verify and set Podman connection
-    log_info "Checking Podman connections..."
-    podman system connection list 2>&1 | tee -a "${LOG_FILE}"
-    if ! podman system connection list --format '{{.Name}}' 2>/dev/null | grep -q "podman-machine-default"; then
-        log_error "No podman-machine-default connection found. Run 'podman system connection list' and set default with 'podman system connection default podman-machine-default'."
+    log_info "Disk space check passed: ${free_space}GB available."
+    # Check network connectivity for Ubuntu image
+    if ! curl -s -I "${IMAGE_URL}" >/dev/null; then
+        log_error "Failed to access Ubuntu Noble image at ${IMAGE_URL}. Check your network connection."
     fi
-    podman system connection default podman-machine-default >/dev/null 2>&1 || log_error "Failed to set podman-machine-default as default connection."
+    log_info "Network connectivity check passed."
+    # Warn if socket_vmnet is running (unnecessary with user-v2 networking)
+    if brew services list | grep -q "socket_vmnet.*started"; then
+        log_warn "socket_vmnet service is running but not needed with user-v2 networking. You can stop it with 'brew services stop socket_vmnet' if you have sudo access."
+    fi
+}
 
-    # Get Podman socket path dynamically with retries
-    local podman_socket=""
-    local retries=3
-    local wait=3
-    for ((i=1; i<=retries; i++)); do
-        podman_socket=$(podman machine inspect podman-machine-default --format '{{.ConnectionInfo.PodmanSocket.Path}}' 2>/dev/null || echo "")
-        if [ -n "${podman_socket}" ] && [ -S "${podman_socket}" ]; then
-            log_info "Podman socket found at ${podman_socket}"
-            break
+# --- Download Ubuntu Image with Progress Bar ---
+download_ubuntu_image() {
+    log_info "Downloading Ubuntu Noble image with progress bar..."
+    mkdir -p "${INSTALL_DIR}"
+    # Try downloading with curl and progress bar, with up to 3 retries
+    for attempt in {1..3}; do
+        log_info "Download attempt ${attempt}/3..."
+        if command -v pv >/dev/null 2>&1; then
+            # Use pv if available for a detailed progress bar
+            curl -sL "${IMAGE_URL}" | pv -p -b -r -t -e -N "Downloading ${IMAGE_URL}" > "${IMAGE_PATH}" && break
+        else
+            # Fallback to curl with built-in progress bar
+            echo "Downloading ${IMAGE_URL}..."
+            curl -L "${IMAGE_URL}" --progress-bar -o "${IMAGE_PATH}" 2>&1 | tee -a "${LOG_FILE}" && break
         fi
-        log_info "Attempt $i/$retries: Podman socket not found. Starting system service and retrying in ${wait}s..."
-        podman system service --timeout=0 >/dev/null 2>&1 || podman system service >/dev/null 2>&1 &
-        sleep ${wait}
-        if [ $i -eq ${retries} ]; then
-            podman_socket="/var/folders/5n/03y3qk412l10xzcylyd71t9c0000gp/T/podman/podman-machine-default-api.sock"
-            if [ ! -S "${podman_socket}" ]; then
-                log_error "Podman socket ${podman_socket} not found after retries. Ensure Podman machine is running ('podman machine start'), verify connection ('podman system connection list'), and check 'podman machine inspect podman-machine-default'."
-            fi
+        if [ "${attempt}" -lt 3 ]; then
+            log_warn "Download failed. Retrying in 5 seconds..."
+            sleep 5
+        else
+            log_error "Failed to download Ubuntu Noble image after 3 attempts. Check ${LOG_FILE} for details."
         fi
     done
-    log_info "Podman socket confirmed at ${podman_socket}"
-    PODMAN_SOCKET="${podman_socket}"
+    # Verify the image file exists and is non-empty
+    if [ ! -s "${IMAGE_PATH}" ]; then
+        log_error "Downloaded image at ${IMAGE_PATH} is missing or empty."
+    fi
+    log_info "Ubuntu Noble image downloaded successfully to ${IMAGE_PATH}."
 }
 
-check_git_credentials() {
-    log_info "Checking Git credentials for ${GITOPS_REMOTE_URL}..."
-    if ! git config --global credential.helper | grep -q "osxkeychain"; then
-        log_info "Configuring macOS keychain for Git credentials..."
-        git config --global credential.helper osxkeychain || log_error "Failed to configure Git credential helper."
-    fi
-    if ! git ls-remote "${GITOPS_REMOTE_URL}" >/dev/null 2>&1; then
-        log_error "Failed to access ${GITOPS_REMOTE_URL}. Ensure you have a fine-grained personal access token (PAT) with write access.\n" \
-                  "Steps to create a PAT:\n" \
-                  "1. Go to https://github.com/settings/tokens?type=beta and click 'Generate new token'.\n" \
-                  "2. Select 'Fine-grained token', name it, and set permissions: 'Contents' (read and write) for repository access.\n" \
-                  "3. Generate the token and copy it.\n" \
-                  "4. Run the script again; when prompted, enter your GitHub username and the PAT as the password.\n" \
-                  "5. The PAT will be cached in macOS keychain for future use."
-    fi
-}
-
-# --- Check Existing Resources ---
-check_existing_resources() {
-log_info "Checking existing resources for idempotency..."
-    if [ -f "${K3S_BIN_DIR}/kubectl" ] && [ -f "${K3S_CONFIG_DIR}/kubeconfig.yaml" ]; then
-        if "${K3S_BIN_DIR}/kubectl" --kubeconfig="${K3S_CONFIG_DIR}/kubeconfig.yaml" get nodes >/dev/null 2>&1; then
-            log_info "K3s is already running."
-        else
-            log_warn "K3s kubectl found but cluster is not running. Attempting to start..."
-            # Attempt to restart Podman machine to ensure cgroup support
-            podman machine stop >/dev/null 2>&1
-            podman machine start >/dev/null 2>&1 || log_error "Failed to restart Podman machine."
-            sleep 5
-        fi
-    fi
-    if command -v kubectl >/dev/null 2>&1; then
-        local kubectl_version
-        kubectl_version=$(kubectl version --client --output=json | grep -o '"gitVersion": "[^"]*"' | cut -d'"' -f4)
-        if [[ "${kubectl_version}" =~ ^v1\.(28|29|30|31|32|33)\. ]]; then
-            log_info "kubectl ${kubectl_version} is compatible (v1.28.x-v1.33.x)."
-        else
-            log_warn "kubectl ${kubectl_version} is not within v1.28.x-v1.33.x. May cause compatibility issues."
-        fi
-    fi
-    if command -v helm >/dev/null 2>&1 && helm version --short | grep -q "${HELM_VERSION}"; then
-        log_info "Helm ${HELM_VERSION} is already installed."
-    fi
-    if command -v helm >/dev/null 2>&1 && [ -f "${K3S_CONFIG_DIR}/kubeconfig.yaml" ]; then
-        helm --kubeconfig="${K3S_CONFIG_DIR}/kubeconfig.yaml" list -A | grep -q kamaji && log_info "Kamaji Helm release already exists."
-        helm --kubeconfig="${K3S_CONFIG_DIR}/kubeconfig.yaml" list -A | grep -q argocd && log_info "ArgoCD Helm release already exists."
-        helm --kubeconfig="${K3S_CONFIG_DIR}/kubeconfig.yaml" list -A | grep -q crossplane && log_info "Crossplane Helm release already exists."
-        [ "${INSTALL_METALLB}" = true ] && helm --kubeconfig="${K3S_CONFIG_DIR}/kubeconfig.yaml" list -A | grep -q metallb && log_info "MetalLB Helm release already exists."
-        helm --kubeconfig="${K3S_CONFIG_DIR}/kubeconfig.yaml" list -A | grep -q sveltos && log_info "Sveltos Helm release already exists."
-    fi
-    if [ -d "${GITOPS_REPO_DIR}/.git" ]; then
-        log_info "GitOps repository already exists at ${GITOPS_REPO_DIR}."
-    fi
-    if [ -f "${K3S_CONFIG_DIR}/kubeconfig.yaml" ] && "${K3S_BIN_DIR}/kubectl" --kubeconfig="${K3S_CONFIG_DIR}/kubeconfig.yaml" get application -n argocd "${ARGOCD_APP_NAME}" >/dev/null 2>&1; then
-        log_info "ArgoCD Application '${ARGOCD_APP_NAME}' already exists."
-    fi
+# --- Create and Manage Lima VM ---
+manage_lima_vm() {
+    log_info "Creating and configuring Lima VM '${LIMA_VM_NAME}'..."
+    download_ubuntu_image
+    cat <<EOF > "${INSTALL_DIR}/lima-config.yaml"
+arch: aarch64
+images:
+  - location: "${IMAGE_PATH}"
+    arch: aarch64
+cpus: 4
+memory: "4GiB"
+disk: "20GiB"
+mounts:
+  - location: "/var/lib/rancher"
+    writable: true
+  - location: "/etc/rancher"
+    writable: true
+mountType: 9p
+containerd:
+  system: false
+  user: false
+networks:
+  - lima: user-v2
+portForwards:
+  - guestPort: 6443
+    hostPort: 6443
+EOF
+    limactl create --name "${LIMA_VM_NAME}" "${INSTALL_DIR}/lima-config.yaml" 2>&1 | tee -a "${LOG_FILE}" || log_error "Failed to create Lima VM '${LIMA_VM_NAME}'. Check ${LOG_FILE} for details and run 'limactl create --name ${LIMA_VM_NAME} ${INSTALL_DIR}/lima-config.yaml' manually."
+    limactl start "${LIMA_VM_NAME}" 2>&1 | tee -a "${LOG_FILE}" || log_error "Failed to start Lima VM '${LIMA_VM_NAME}'. Check ${LOG_FILE} for details and run 'limactl start ${LIMA_VM_NAME}' manually."
+    log_info "Lima VM '${LIMA_VM_NAME}' is running."
+    # Ensure K3s data directories are accessible in the VM
+    limactl shell "${LIMA_VM_NAME}" sudo mkdir -p /var/lib/rancher/k3s /etc/rancher/k3s >/dev/null 2>&1
+    limactl shell "${LIMA_VM_NAME}" sudo chmod -R 777 /var/lib/rancher/k3s /etc/rancher/k3s >/dev/null 2>&1
 }
 
 # --- Setup Directories ---
@@ -192,12 +193,17 @@ setup_directories() {
 install_dependencies() {
     log_info "Checking and installing dependencies..."
     check_command brew
-    for cmd in curl git; do
+    for cmd in curl git limactl; do
         if ! command -v "${cmd}" >/dev/null 2>&1; then
             log_info "Installing ${cmd} via Homebrew..."
             brew install "${cmd}" || log_error "Failed to install ${cmd}."
         fi
     done
+    # Install pv for enhanced progress bar if not present
+    if ! command -v pv >/dev/null 2>&1; then
+        log_info "Installing pv for download progress bar..."
+        brew install pv || log_warn "Failed to install pv. Falling back to curl progress bar."
+    fi
     if ! command -v kubectl >/dev/null 2>&1; then
         log_info "Installing kubectl ${KUBECTL_VERSION}..."
         curl -LO "https://dl.k8s.io/release/${KUBECTL_VERSION}/bin/darwin/arm64/kubectl" || log_error "Failed to download kubectl."
@@ -240,46 +246,30 @@ install_dependencies() {
     fi
 }
 
-# --- Install K3s with Podman ---
+# --- Install K3s in Lima VM ---
 install_k3s() {
-    if [ -f "${K3S_BIN_DIR}/kubectl" ] && [ -f "${K3S_CONFIG_DIR}/kubeconfig.yaml" ] && "${K3S_BIN_DIR}/kubectl" --kubeconfig="${K3S_CONFIG_DIR}/kubeconfig.yaml" get nodes >/dev/null 2>&1; then
-        log_info "K3s is already installed and running. Skipping installation."
-        return
-    fi
-    log_info "Installing K3s ${K3S_VERSION} as a Podman container..."
+    log_info "Installing K3s ${K3S_VERSION} in Lima VM '${LIMA_VM_NAME}'..."
     export PATH="${K3S_BIN_DIR}:${PATH}"
     mkdir -p "${K3S_CONFIG_DIR}" "${K3S_DATA_DIR}" || log_error "Failed to create K3s directories."
     chmod 700 "${K3S_CONFIG_DIR}" "${K3S_DATA_DIR}"
-    if podman ps -a --format '{{.Names}}' | grep -q "^k3s-server$"; then
-        log_info "Removing existing K3s container..."
-        podman rm -f k3s-server >/dev/null 2>&1
-    fi
-    podman rm -f k3s-server
-    rm -rf ~/.rancher/k3s/*
-    podman run -d --name k3s-server \
-        --privileged \
-        --cgroupns=host \
-        -v "${K3S_DATA_DIR}:/var/lib/rancher/k3s" \
-        -v "${K3S_CONFIG_DIR}:/etc/rancher/k3s" \
-        -e K3S_KUBECONFIG_OUTPUT=/etc/rancher/k3s/kubeconfig.yaml \
-        -e K3S_KUBECONFIG_MODE=644 \
-        -p 6443:6443 \
-        docker.io/rancher/k3s:${K3S_VERSION} \
-        ${K3S_EXEC}|| log_error "Failed to start K3s container."
-    sleep 30
-    if [ ! -f "${K3S_CONFIG_DIR}/kubeconfig.yaml" ]; then
-        log_error "Kubeconfig not found at ${K3S_CONFIG_DIR}/kubeconfig.yaml."
-    fi
+    # Install dependencies in the VM
+    limactl shell "${LIMA_VM_NAME}" sudo apt-get update >/dev/null 2>&1
+    limactl shell "${LIMA_VM_NAME}" sudo apt-get install -y conntrack iptables >/dev/null 2>&1 || log_error "Failed to install K3s dependencies in Lima VM."
+    # Install K3s in the VM
+    limactl shell "${LIMA_VM_NAME}" bash -c "curl -sfL https://get.k3s.io | INSTALL_K3S_VERSION=${K3S_VERSION} K3S_KUBECONFIG_MODE=644 sh -s - ${K3S_EXEC}" 2>&1 | tee -a "${LOG_FILE}" || log_error "Failed to install K3s in Lima VM. Check ${LOG_FILE} for details."
+    sleep 60 # Increased sleep to ensure K3s is ready
+    # Copy kubeconfig to host
+    limactl copy "${LIMA_VM_NAME}:/etc/rancher/k3s/k3s.yaml" "${K3S_CONFIG_DIR}/kubeconfig.yaml" || log_error "Failed to copy kubeconfig from Lima VM."
     sed -i '' "s/0.0.0.0:6443/127.0.0.1:6443/g" "${K3S_CONFIG_DIR}/kubeconfig.yaml" || log_error "Failed to update kubeconfig."
     chmod 600 "${K3S_CONFIG_DIR}/kubeconfig.yaml" || log_error "Failed to set kubeconfig permissions."
     if ! "${K3S_BIN_DIR}/kubectl" --kubeconfig="${K3S_CONFIG_DIR}/kubeconfig.yaml" get nodes >/dev/null 2>&1; then
-        log_info "K3s container status:"
-        podman ps -a --filter name=k3s-server | tee -a "${LOG_FILE}"
-        log_info "K3s container logs:"
-        podman logs k3s-server 2>&1 | tee -a "${LOG_FILE}"
-        log_error "K3s cluster not running. Check container logs above and ${LOG_FILE}."
+        log_info "K3s VM status:"
+        limactl list --format '{{.Name}} {{.Status}}' | grep "${LIMA_VM_NAME}" | tee -a "${LOG_FILE}"
+        log_info "K3s logs from VM:"
+        limactl shell "${LIMA_VM_NAME}" sudo journalctl -u k3s -n 100 2>&1 | tee -a "${LOG_FILE}"
+        log_error "K3s cluster not running. Check logs above and ${LOG_FILE}."
     fi
-    log_info "K3s installed successfully."
+    log_info "K3s installed successfully in Lima VM."
 }
 
 # --- Setup Helm Repositories ---
@@ -297,7 +287,7 @@ setup_helm_repos() {
 
 # --- Install Tools ---
 install_calico() {
-    kubectl --kubeconfig="${K3S_CONFIG_DIR}/kubeconfig.yaml" apply -f https://docs.projectcalico.org/manifests/calico.yaml
+    "${K3S_BIN_DIR}/kubectl" --kubeconfig="${K3S_CONFIG_DIR}/kubeconfig.yaml" apply -f https://docs.projectcalico.org/manifests/calico.yaml
     sleep 60
 }
 
@@ -414,15 +404,16 @@ setup_gitops_repo() {
     mkdir -p documentation infra-setup/{metal3,metallb,crossplane-provider} kamaji-clusters base-addons demos/{f5-bnk,f5-spk,other-products} clusters-apps/{example-app1,example-app2} scripts || log_error "Failed to create GitOps repo structure."
     if [ ! -f .gitignore ]; then
         cat <<EOF > .gitignore
-# Ignore K3s setup artifacts
+# Ignore K3s and Lima setup artifacts
 ${INSTALL_DIR#/Users/*/}
 *.log
+.lima/
 EOF
     fi
     if [ ! -f README.md ]; then
         cat <<EOF > README.md
 # Multi-Tenant Kubernetes Demo Platform
-This repository provides a GitOps-driven platform for managing multiple Kubernetes tenant clusters using a k3s management cluster. It supports rapid deployments of F5 BIG-IP Next Kubernetes (BNK) and Service Proxy Kubernetes (SPK) for demos.
+This repository provides a GitOps-driven platform for managing multiple Kubernetes tenant clusters using a K3s management cluster running in a Lima VM. It supports rapid deployments of F5 BIG-IP Next Kubernetes (BNK) and Service Proxy Kubernetes (SPK) for demos.
 See documentation/ for quickstart guides.
 EOF
     fi
@@ -466,9 +457,6 @@ EOF
 # --- Configure ArgoCD to Watch GitOps Repository ---
 configure_argocd_gitops() {
     log_info "Configuring ArgoCD to watch remote GitOps repository at ${GITOPS_REMOTE_URL}..."
-    if "${K3S_BIN_DIR}/kubectl" --kubeconfig="${K3S_CONFIG_DIR}/kubeconfig.yaml" get application -n argocd "${ARGOCD_APP_NAME}" >/dev/null 2>&1; then
-        log_info "ArgoCD Application '${ARGOCD_APP_NAME}' already exists. Updating configuration..."
-    fi
     cat <<EOF | "${K3S_BIN_DIR}/kubectl" --kubeconfig="${K3S_CONFIG_DIR}/kubeconfig.yaml" apply -f -
 apiVersion: argoproj.io/v1alpha1
 kind: Application
@@ -494,11 +482,30 @@ EOF
     log_info "ArgoCD Application '${ARGOCD_APP_NAME}' configured to watch ${GITOPS_REMOTE_URL}/${ARGOCD_GITOPS_PATH} on branch ${GITOPS_BRANCH}."
 }
 
+check_git_credentials() {
+    log_info "Checking Git credentials for ${GITOPS_REMOTE_URL}..."
+    if ! git config --global credential.helper | grep -q "osxkeychain"; then
+        log_info "Configuring macOS keychain for Git credentials..."
+        git config --global credential.helper osxkeychain || log_error "Failed to configure Git credential helper."
+    fi
+    if ! git ls-remote "${GITOPS_REMOTE_URL}" >/dev/null 2>&1; then
+        log_error "Failed to access ${GITOPS_REMOTE_URL}. Ensure you have a fine-grained personal access token (PAT) with write access.\n" \
+                  "Steps to create a PAT:\n" \
+                  "1. Go to https://github.com/settings/tokens?type=beta and click 'Generate new token'.\n" \
+                  "2. Select 'Fine-grained token', name it, and set permissions: 'Contents' (read and write) for repository access.\n" \
+                  "3. Generate the token and copy it.\n" \
+                  "4. Run the script again; when prompted, enter your GitHub username and the PAT as the password.\n" \
+                  "5. The PAT will be cached in macOS keychain for future use."
+    fi
+}
+
 # --- Main Execution ---
 main() {
-    log_info "Starting bootstrap-laptop.sh on MacBook Pro M1 (MetalLB: ${INSTALL_METALLB})..."
-    check_existing_resources
-    check_podman
+    log_info "Starting bootstrap-laptop.sh on MacBook Pro M1 with Lima (MetalLB: ${INSTALL_METALLB})..."
+    reset_environment
+    validate_prerequisites
+    check_lima
+    manage_lima_vm
     install_dependencies
     setup_directories
     install_k3s
@@ -511,7 +518,7 @@ main() {
     install_sveltos
     setup_gitops_repo
     configure_argocd_gitops
-    log_info "Bootstrap completed successfully! K3s cluster is running, tools are installed, and GitOps repo is set up at ${GITOPS_REPO_DIR}."
+    log_info "Bootstrap completed successfully! K3s cluster is running in Lima VM '${LIMA_VM_NAME}', tools are installed, and GitOps repo is set up at ${GITOPS_REPO_DIR}."
     log_info "Kubeconfig is available at ${K3S_CONFIG_DIR}/kubeconfig.yaml"
     log_info "Logs are available at ${LOG_FILE}"
     local admin_password
@@ -522,6 +529,7 @@ main() {
     if [ "${INSTALL_METALLB}" = true ]; then
         log_info "ArgoCD is configured with LoadBalancer. Check external IP with:"
         log_info "  kubectl --kubeconfig=${K3S_CONFIG_DIR}/kubeconfig.yaml -n argocd get svc argocd-server"
+        log_warn "MetalLB may have limited functionality with user-v2 networking. Consider using NodePort (INSTALL_METALLB=false) for demo purposes."
     else
         local node_port
         node_port=$("${K3S_BIN_DIR}/kubectl" --kubeconfig="${K3S_CONFIG_DIR}/kubeconfig.yaml" -n argocd get svc argocd-server -o jsonpath='{.spec.ports[0].nodePort}' 2>/dev/null) || log_warn "Failed to retrieve ArgoCD NodePort. Service may not be ready yet."
