@@ -24,6 +24,7 @@ SVELTOS_VERSION="0.54.0"
 GITOPS_REPO_URL="https://github.com/JLCode-tech/build-demo-tooling.git"
 GITOPS_REPO_DIR="${INSTALL_DIR}/build-demo-tooling"
 LOG_FILE="/tmp/bootstrap-onprem-$(date +%Y%m%d_%H%M%S).log"
+INSTALL_METALLB="true"  # Set to "false" if you want to skip installing MetalLB
 METALLB_IP_POOL="10.10.20.240/28"  # Update per your networking requirements
 
 ## Logging Functions ##
@@ -75,16 +76,17 @@ deploy_charts() {
     helm repo add projectsveltos https://projectsveltos.github.io/helm-charts
     helm repo add cert-manager https://charts.jetstack.io
     helm repo update
-
     log_info "Deploying Helm charts..."
     helm upgrade --install cert-manager cert-manager/cert-manager --version "$CERT_MANAGER_VERSION" -n cert-manager --create-namespace --set installCRDs=true
     helm upgrade --install kamaji clastix/kamaji --version "$KAMAJI_VERSION" -n kamaji-system --create-namespace --set image.tag=latest
     helm upgrade --install argocd argo/argo-cd --version "$ARGOCD_VERSION" -n argocd --create-namespace
     helm upgrade --install crossplane crossplane-stable/crossplane --version "$CROSSPLANE_VERSION" -n crossplane-system --create-namespace
     helm upgrade --install sveltos projectsveltos/projectsveltos --version "$SVELTOS_VERSION" -n projectsveltos --create-namespace
+    helm upgrade --install sveltos-crds projectsveltos/sveltos-crds --version "$SVELTOS_VERSION" -n projectsveltos
     helm upgrade --install sveltos-dashboard projectsveltos/sveltos-dashboard --version "$SVELTOS_VERSION" -n projectsveltos
-    helm upgrade --install metallb metallb/metallb --version "$METALLB_VERSION" -n metallb-system --create-namespace
-    cat <<EOF | kubectl apply -f -
+    if [ "${INSTALL_METALLB}" = "true" ]; then
+      helm upgrade --install metallb metallb/metallb --version "$METALLB_VERSION" -n metallb-system --create-namespace
+      kubectl apply -f- <<EOF
 apiVersion: metallb.io/v1beta1
 kind: IPAddressPool
 metadata:
@@ -103,6 +105,9 @@ spec:
   ipAddressPools:
   - demo-pool
 EOF
+    else
+      log_info "Skipping MetalLB as per configuration."
+    fi
     log_info "Helm deployments complete."
 }
 
