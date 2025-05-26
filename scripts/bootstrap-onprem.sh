@@ -17,6 +17,7 @@ K3S_VERSION="v1.33.0+k3s1"
 HELM_VERSION="v3.14.3"
 ARGOCD_VERSION="8.0.10"
 CROSSPLANE_VERSION="1.20.0"
+CERT_MANAGER_VERSION="v1.17.2"
 KAMAJI_VERSION="1.0.0"
 METALLB_VERSION="0.14.9"
 SVELTOS_VERSION="0.54.0"
@@ -72,14 +73,16 @@ deploy_charts() {
     helm repo add crossplane-stable https://charts.crossplane.io/stable
     helm repo add metallb https://metallb.github.io/metallb
     helm repo add projectsveltos https://projectsveltos.github.io/helm-charts
+    helm repo add cert-manager https://charts.jetstack.io
     helm repo update
 
     log_info "Deploying Helm charts..."
-    helm upgrade --install kamaji clastix/kamaji --version "$KAMAJI_VERSION" -n kamaji-system --create-namespace
+    helm upgrade --install cert-manager cert-manager/cert-manager --version "$CERT_MANAGER_VERSION" -n cert-manager --create-namespace --set installCRDs=true
+    helm upgrade --install kamaji clastix/kamaji --version "$KAMAJI_VERSION" -n kamaji-system --create-namespace --set image.tag=latest
     helm upgrade --install argocd argo/argo-cd --version "$ARGOCD_VERSION" -n argocd --create-namespace
     helm upgrade --install crossplane crossplane-stable/crossplane --version "$CROSSPLANE_VERSION" -n crossplane-system --create-namespace
-    helm upgrade --install sveltos projectsveltos/sveltos --version "$SVELTOS_VERSION" -n projectsveltos --create-namespace
-
+    helm upgrade --install sveltos projectsveltos/projectsveltos --version "$SVELTOS_VERSION" -n projectsveltos --create-namespace
+    helm upgrade --install sveltos-dashboard projectsveltos/sveltos-dashboard --version "$SVELTOS_VERSION" -n projectsveltos
     helm upgrade --install metallb metallb/metallb --version "$METALLB_VERSION" -n metallb-system --create-namespace
     cat <<EOF | kubectl apply -f -
 apiVersion: metallb.io/v1beta1
