@@ -3,4 +3,7 @@ jammy-server-cloudimg-arm64.img
 *.mp4
 *.tar.gz
 *.img
+*.json
 archive
+demos/f5-bnk
+demos/f5-spk
